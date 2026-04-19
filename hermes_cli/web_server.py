@@ -334,6 +334,293 @@ _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
 _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "3"))
 
 
+def _trace_code_ref(file: str, start: int, end: int, label: str) -> Dict[str, Any]:
+    """Build a compact code reference payload for trace visualizations."""
+    return {
+        "file": file,
+        "start_line": start,
+        "end_line": end,
+        "label": label,
+    }
+
+
+def _normalize_trace_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a frontend-safe message dict with stable fields."""
+    return {
+        "role": message.get("role", "unknown"),
+        "content": message.get("content"),
+        "tool_calls": message.get("tool_calls") or [],
+        "tool_name": message.get("tool_name"),
+        "tool_call_id": message.get("tool_call_id"),
+        "finish_reason": message.get("finish_reason"),
+    }
+
+
+def _segment_system_prompt(prompt: str) -> List[Dict[str, str]]:
+    """Split a stored system prompt into a few high-signal learning layers."""
+    if not prompt:
+        return []
+
+    markers = [
+        ("## Skills (mandatory)", "skills", "Skills Index"),
+        ("# Project Context", "project_context", "Project Context"),
+        ("Conversation started:", "runtime_metadata", "Runtime Metadata"),
+    ]
+    positions: List[tuple[int, str, str, str]] = []
+    for needle, kind, title in markers:
+        idx = prompt.find(needle)
+        if idx != -1:
+            positions.append((idx, needle, kind, title))
+
+    positions.sort(key=lambda item: item[0])
+    segments: List[Dict[str, str]] = []
+    cursor = 0
+
+    if not positions:
+        return [{"kind": "core_instructions", "title": "Core Instructions", "content": prompt}]
+
+    first_idx = positions[0][0]
+    if first_idx > 0:
+        core = prompt[:first_idx].strip()
+        if core:
+            segments.append({
+                "kind": "core_instructions",
+                "title": "Core Instructions",
+                "content": core,
+            })
+
+    for idx, _needle, kind, title in positions:
+        next_idx = next((p[0] for p in positions if p[0] > idx), len(prompt))
+        content = prompt[idx:next_idx].strip()
+        if content:
+            segments.append({
+                "kind": kind,
+                "title": title,
+                "content": content,
+            })
+        cursor = next_idx
+
+    if cursor < len(prompt):
+        tail = prompt[cursor:].strip()
+        if tail:
+            segments.append({
+                "kind": "additional_context",
+                "title": "Additional Context",
+                "content": tail,
+            })
+
+    return segments
+
+
+def _extract_tool_surface(raw_tools: Any) -> List[Dict[str, Any]]:
+    """Normalize stored tool schemas into a compact tool surface list."""
+    surface: List[Dict[str, Any]] = []
+    if not isinstance(raw_tools, list):
+        return surface
+
+    for entry in raw_tools:
+        if not isinstance(entry, dict):
+            continue
+        fn = entry.get("function") or {}
+        if not isinstance(fn, dict):
+            continue
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        surface.append({
+            "name": name,
+            "description": str(fn.get("description") or "").strip(),
+        })
+    return surface
+
+
+def _build_session_trace_payload(
+    *,
+    session_id: str,
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    source: str = "sqlite",
+) -> Dict[str, Any]:
+    """Derive a request/response/tool trace from persisted session state."""
+    normalized_messages = [
+        _normalize_trace_message(msg if isinstance(msg, dict) else {})
+        for msg in messages
+    ]
+    tool_surface = _extract_tool_surface(tools)
+
+    steps: List[Dict[str, Any]] = []
+    first_user = next(
+        (msg for msg in normalized_messages if msg.get("role") == "user" and msg.get("content")),
+        None,
+    )
+    if first_user:
+        steps.append({
+            "id": "user-input",
+            "kind": "user_input",
+            "title": "User Input",
+            "summary": "The user turn is appended to the in-memory transcript before the first model call.",
+            "content": first_user.get("content"),
+            "code_refs": [
+                _trace_code_ref("run_agent.py", 8815, 8819, "Append current user turn"),
+            ],
+        })
+
+    if system_prompt:
+        steps.append({
+            "id": "system-prompt",
+            "kind": "system_prompt",
+            "title": "System Prompt Build",
+            "summary": "Hermes builds and caches a stable system prompt snapshot for the session.",
+            "content": system_prompt,
+            "segments": _segment_system_prompt(system_prompt),
+            "code_refs": [
+                _trace_code_ref("run_agent.py", 3638, 3778, "Assemble cached system prompt"),
+                _trace_code_ref("agent/prompt_builder.py", 894, 1046, "Load context files and prompt sections"),
+            ],
+        })
+
+    if tool_surface:
+        steps.append({
+            "id": "tool-surface",
+            "kind": "tool_surface",
+            "title": "Tool Surface",
+            "summary": f"{len(tool_surface)} tools were exposed to the model for this session.",
+            "tools": tool_surface,
+            "code_refs": [
+                _trace_code_ref("model_tools.py", 196, 315, "Filter tools and export schemas"),
+                _trace_code_ref("tools/registry.py", 258, 286, "Return OpenAI-format tool definitions"),
+            ],
+        })
+
+    assistant_indexes = [
+        idx for idx, msg in enumerate(normalized_messages)
+        if msg.get("role") == "assistant"
+    ]
+    last_assistant_idx = assistant_indexes[-1] if assistant_indexes else -1
+    iteration = 0
+
+    for idx, assistant_msg in enumerate(normalized_messages):
+        if assistant_msg.get("role") != "assistant":
+            continue
+
+        iteration += 1
+        prior_messages = normalized_messages[:idx]
+        steps.append({
+            "id": f"api-request-{iteration}",
+            "kind": "api_request",
+            "iteration": iteration,
+            "title": f"API Request #{iteration}",
+            "summary": (
+                f"System prompt + {len(prior_messages)} prior messages"
+                f" + {len(tool_surface)} tool definitions"
+            ),
+            "request": {
+                "system_prompt": system_prompt,
+                "messages": prior_messages,
+                "tool_names": [tool["name"] for tool in tool_surface],
+                "message_count": len(prior_messages),
+                "tool_count": len(tool_surface),
+            },
+            "notes": [
+                "This request view is reconstructed from persisted session state.",
+                "Ephemeral runtime-only injections such as pre_llm_call context are not persisted in the session log.",
+            ],
+            "code_refs": [
+                _trace_code_ref("run_agent.py", 9091, 9177, "Assemble API-facing messages"),
+                _trace_code_ref("run_agent.py", 6834, 6948, "Build provider-specific request kwargs"),
+            ],
+        })
+
+        tool_calls = assistant_msg.get("tool_calls") or []
+        if tool_calls:
+            steps.append({
+                "id": f"assistant-tool-calls-{iteration}",
+                "kind": "assistant_tool_calls",
+                "iteration": iteration,
+                "title": f"Model Returned Tool Calls #{iteration}",
+                "summary": f"The model emitted {len(tool_calls)} tool call(s).",
+                "content": assistant_msg.get("content"),
+                "tool_calls": tool_calls,
+                "code_refs": [
+                    _trace_code_ref("run_agent.py", 11006, 11236, "Validate tool calls and enter tool execution"),
+                ],
+            })
+
+            tool_name_by_id: Dict[str, str] = {}
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or "")
+                fn = call.get("function") or {}
+                if call_id and isinstance(fn, dict):
+                    tool_name_by_id[call_id] = str(fn.get("name") or "")
+
+            cursor = idx + 1
+            tool_result_index = 0
+            while cursor < len(normalized_messages) and normalized_messages[cursor].get("role") == "tool":
+                tool_result_index += 1
+                tool_msg = normalized_messages[cursor]
+                inferred_tool_name = (
+                    tool_msg.get("tool_name")
+                    or tool_name_by_id.get(str(tool_msg.get("tool_call_id") or ""))
+                    or "tool"
+                )
+                steps.append({
+                    "id": f"tool-result-{iteration}-{tool_result_index}",
+                    "kind": "tool_result",
+                    "iteration": iteration,
+                    "title": f"Tool Result #{iteration}.{tool_result_index}",
+                    "summary": f"Python executed `{inferred_tool_name}` and appended its result as a tool message.",
+                    "content": tool_msg.get("content"),
+                    "tool_name": inferred_tool_name,
+                    "tool_call_id": tool_msg.get("tool_call_id"),
+                    "code_refs": [
+                        _trace_code_ref("run_agent.py", 7682, 8500, "Execute tool batch and append tool messages"),
+                        _trace_code_ref("model_tools.py", 421, 528, "Dispatch registry-backed tools"),
+                        _trace_code_ref("tools/registry.py", 292, 309, "Invoke the concrete tool handler"),
+                    ],
+                })
+                cursor += 1
+        else:
+            response_kind = "final_response" if idx == last_assistant_idx else "assistant_response"
+            steps.append({
+                "id": f"{response_kind.replace('_', '-')}-{iteration}",
+                "kind": response_kind,
+                "iteration": iteration,
+                "title": "Final Response" if response_kind == "final_response" else f"Assistant Response #{iteration}",
+                "summary": (
+                    "The loop ends because this assistant turn has no tool calls."
+                    if response_kind == "final_response"
+                    else "Assistant text turn without tool calls."
+                ),
+                "content": assistant_msg.get("content"),
+                "code_refs": [
+                    _trace_code_ref("run_agent.py", 11300, 11720, "Finalize assistant response and persist session"),
+                ],
+            })
+
+    return {
+        "session_id": session_id,
+        "source": source,
+        "notes": [
+            "The trace is derived from persisted session state rather than a live packet capture.",
+            "Stable system prompt snapshots are preserved; ephemeral runtime-only prompt injections are not persisted.",
+        ],
+        "step_kinds": [
+            "user_input",
+            "system_prompt",
+            "tool_surface",
+            "api_request",
+            "assistant_tool_calls",
+            "tool_result",
+            "assistant_response",
+            "final_response",
+        ],
+        "steps": steps,
+    }
+
+
 def _probe_gateway_health() -> tuple[bool, dict | None]:
     """Probe the gateway via its HTTP health endpoint (cross-container).
 
@@ -1693,6 +1980,60 @@ async def get_session_messages(session_id: str):
             raise HTTPException(status_code=404, detail="Session not found")
         messages = db.get_messages(sid)
         return {"session_id": sid, "messages": messages}
+    finally:
+        db.close()
+
+
+@app.get("/api/sessions/{session_id}/trace")
+async def get_session_trace(session_id: str):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        session = db.get_session(sid)
+        messages = db.get_messages(sid)
+        session_log_path = get_hermes_home() / "sessions" / f"session_{sid}.json"
+
+        if session_log_path.exists():
+            try:
+                payload = json.loads(session_log_path.read_text(encoding="utf-8"))
+                log_messages = payload.get("messages")
+                if isinstance(log_messages, list) and log_messages:
+                    messages = log_messages
+                system_prompt = str(
+                    payload.get("system_prompt")
+                    or (session.get("system_prompt") if session else "")
+                    or ""
+                )
+                tools = payload.get("tools")
+                trace = _build_session_trace_payload(
+                    session_id=sid,
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    tools=tools if isinstance(tools, list) else None,
+                    source="session_log",
+                )
+                trace["session_log_path"] = str(session_log_path)
+                return trace
+            except Exception as exc:
+                _log.warning("Failed to parse session log %s: %s", session_log_path, exc)
+
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        trace = _build_session_trace_payload(
+            session_id=sid,
+            messages=messages,
+            system_prompt=str(session.get("system_prompt") or ""),
+            tools=None,
+            source="sqlite",
+        )
+        trace["session_log_path"] = str(session_log_path)
+        return trace
     finally:
         db.close()
 

@@ -17,9 +17,11 @@ import { api } from "@/lib/api";
 import type { SessionInfo, SessionMessage, SessionSearchResult } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { Markdown } from "@/components/Markdown";
+import SessionTraceView from "@/components/SessionTraceView";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useI18n } from "@/i18n";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> = {
@@ -271,20 +273,41 @@ function SessionRow({
 
       {isExpanded && (
         <div className="border-t border-border bg-background/50 p-4">
-          {loading && (
-            <div className="flex items-center justify-center py-8">
-              <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-            </div>
-          )}
-          {error && (
-            <p className="text-sm text-destructive py-4 text-center">{error}</p>
-          )}
-          {messages && messages.length === 0 && (
-            <p className="text-sm text-muted-foreground py-4 text-center">{t.sessions.noMessages}</p>
-          )}
-          {messages && messages.length > 0 && (
-            <MessageList messages={messages} highlight={searchQuery} />
-          )}
+          <Tabs defaultValue="messages">
+            {(active, setActive) => (
+              <>
+                <TabsList>
+                  <TabsTrigger active={active === "messages"} value="messages" onClick={() => setActive("messages")}>
+                    Transcript
+                  </TabsTrigger>
+                  <TabsTrigger active={active === "trace"} value="trace" onClick={() => setActive("trace")}>
+                    Agent Trace
+                  </TabsTrigger>
+                </TabsList>
+
+                {active === "messages" ? (
+                  <>
+                    {loading && (
+                      <div className="flex items-center justify-center py-8">
+                        <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                      </div>
+                    )}
+                    {error && (
+                      <p className="text-sm text-destructive py-4 text-center">{error}</p>
+                    )}
+                    {messages && messages.length === 0 && (
+                      <p className="text-sm text-muted-foreground py-4 text-center">{t.sessions.noMessages}</p>
+                    )}
+                    {messages && messages.length > 0 && (
+                      <MessageList messages={messages} highlight={searchQuery} />
+                    )}
+                  </>
+                ) : (
+                  <SessionTraceView sessionId={session.id} />
+                )}
+              </>
+            )}
+          </Tabs>
         </div>
       )}
     </div>

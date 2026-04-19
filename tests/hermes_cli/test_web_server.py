@@ -263,6 +263,107 @@ class TestWebServerEndpoints:
         )
         assert resp.status_code == 401
 
+    def test_get_session_trace_prefers_session_log(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+        import hermes_state as hs
+
+        hermes_home = tmp_path / ".hermes"
+        sessions_dir = hermes_home / "sessions"
+        sessions_dir.mkdir(parents=True)
+        db_path = hermes_home / "state.db"
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", db_path)
+
+        db = hs.SessionDB(db_path)
+        try:
+            db.create_session("trace-log-1", source="cli", model="openai/gpt-5.4", system_prompt="sqlite prompt")
+            db.append_message("trace-log-1", "user", content="Explain the loop")
+            db.append_message("trace-log-1", "assistant", content="I'll inspect the repo.", tool_calls=[
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\": \"run_agent.py\"}",
+                    },
+                }
+            ])
+            db.append_message("trace-log-1", "tool", content='{"success": true}', tool_call_id="call_1")
+        finally:
+            db.close()
+
+        session_log = {
+            "session_id": "trace-log-1",
+            "system_prompt": "cached prompt from session log",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read file contents",
+                    },
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "Explain the loop"},
+                {
+                    "role": "assistant",
+                    "content": "I'll inspect the repo.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\": \"run_agent.py\"}",
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": '{"success": true}', "tool_call_id": "call_1"},
+                {"role": "assistant", "content": "Here is the result."},
+            ],
+        }
+        (sessions_dir / "session_trace-log-1.json").write_text(
+            json.dumps(session_log),
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/sessions/trace-log-1/trace")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source"] == "session_log"
+        assert any(step["kind"] == "system_prompt" for step in data["steps"])
+        assert any(step["kind"] == "tool_surface" for step in data["steps"])
+        assert any(step["kind"] == "api_request" for step in data["steps"])
+        assert any(step["kind"] == "assistant_tool_calls" for step in data["steps"])
+        assert any(step["kind"] == "tool_result" for step in data["steps"])
+        assert any(step["kind"] == "final_response" for step in data["steps"])
+
+    def test_get_session_trace_falls_back_to_sqlite(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+        import hermes_state as hs
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir(parents=True)
+        db_path = hermes_home / "state.db"
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", db_path)
+
+        db = hs.SessionDB(db_path)
+        try:
+            db.create_session("trace-db-1", source="cli", model="openai/gpt-5.4", system_prompt="sqlite-only prompt")
+            db.append_message("trace-db-1", "user", content="What happens next?")
+            db.append_message("trace-db-1", "assistant", content="Final answer from sqlite only")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/trace-db-1/trace")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source"] == "sqlite"
+        system_step = next(step for step in data["steps"] if step["kind"] == "system_prompt")
+        assert system_step["content"] == "sqlite-only prompt"
+        assert any(step["kind"] == "final_response" for step in data["steps"])
+
     def test_session_token_endpoint_removed(self):
         """GET /api/auth/session-token should no longer exist (token injected via HTML)."""
         resp = self.client.get("/api/auth/session-token")

@@ -40,6 +40,8 @@ export const api = {
     fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
   getSessionMessages: (id: string) =>
     fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
+  getSessionTrace: (id: string) =>
+    fetchJSON<SessionTraceResponse>(`/api/sessions/${encodeURIComponent(id)}/trace`),
   deleteSession: (id: string) =>
     fetchJSON<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}`, {
       method: "DELETE",
@@ -274,6 +276,67 @@ export interface SessionMessage {
 export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessage[];
+}
+
+export interface TraceCodeRef {
+  file: string;
+  start_line: number;
+  end_line: number;
+  label: string;
+}
+
+export interface TracePromptSegment {
+  kind: string;
+  title: string;
+  content: string;
+}
+
+export interface TraceToolInfo {
+  name: string;
+  description?: string;
+}
+
+export interface SessionTraceStep {
+  id: string;
+  kind:
+    | "user_input"
+    | "system_prompt"
+    | "tool_surface"
+    | "api_request"
+    | "assistant_tool_calls"
+    | "tool_result"
+    | "assistant_response"
+    | "final_response";
+  iteration?: number;
+  title: string;
+  summary?: string;
+  content?: string | null;
+  code_refs: TraceCodeRef[];
+  segments?: TracePromptSegment[];
+  tools?: TraceToolInfo[];
+  tool_name?: string;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    function: { name: string; arguments: string };
+  }>;
+  request?: {
+    system_prompt: string;
+    messages: SessionMessage[];
+    tool_names: string[];
+    message_count: number;
+    tool_count: number;
+  };
+  notes?: string[];
+}
+
+export interface SessionTraceResponse {
+  session_id: string;
+  source: "session_log" | "sqlite";
+  session_log_path?: string;
+  notes: string[];
+  step_kinds: string[];
+  steps: SessionTraceStep[];
 }
 
 export interface LogsResponse {
